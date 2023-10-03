@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"sync/atomic"
 	"time"
 
 	csi "github.com/awslabs/volume-modifier-for-k8s/pkg/client"
@@ -23,14 +22,6 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 )
-
-var (
-	controllerStatus atomic.Value
-)
-
-func init() {
-	controllerStatus.Store(false)
-}
 
 var (
 	clientConfigUrl = flag.String("client-config-url", "", "URL to build a client config from. Either this or kubeconfig needs to be set if the provisioner is being run out of cluster.")
@@ -148,9 +139,10 @@ func main() {
 		true, /* retryFailure */
 	)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	leaseInformer := informerFactory.Coordination().V1().Leases().Informer()
+	leaseChannel := make(chan *v1.Lease)
+	go leaseHandler(podName, mc, leaseChannel)
 
+	leaseInformer := informerFactory.Coordination().V1().Leases().Informer()
 	leaseInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			lease, ok := newObj.(*v1.Lease)
@@ -158,31 +150,29 @@ func main() {
 				klog.ErrorS(nil, "Failed to process object, expected it to be a Lease", "obj", newObj)
 				return
 			}
-			handleLeaseUpdate(lease, podName, ctx, cancel, mc)
+			if lease.Name == "external-resizer-ebs-csi-aws-com" {
+				leaseChannel <- lease
+			}
 		},
 	})
 	leaseInformer.Run(wait.NeverStop)
 }
 
-func handleLeaseUpdate(lease *v1.Lease, podName string, ctx context.Context, cancel context.CancelFunc, mc controller.ModifyController) {
-	// If the updated Lease is not relevant, return early
-	if lease.Name != "external-resizer-ebs-csi-aws-com" {
-		return
-	}
-	// Extract the current leader from the Lease
-	currentLeader := *lease.Spec.HolderIdentity
+func leaseHandler(podName string, mc controller.ModifyController, leaseChannel chan *v1.Lease) {
+	var cancel context.CancelFunc = nil
 
-	klog.V(6).InfoS("Controller status", "podName", podName, "currentLeader", currentLeader, "controllerStatus", controllerStatus.Load().(bool))
-
-	if currentLeader == podName && !controllerStatus.Load().(bool) {
-		// If the current leader is the current pod, and the controller is not running, start it
-		klog.InfoS("Starting controller", "podName", podName, "currentLeader", currentLeader)
-		controllerStatus.Store(true)
-		go mc.Run(*workers, ctx)
-	} else if currentLeader != podName && controllerStatus.Load().(bool) {
-		// If the current leader is not the current pod, and the controller is running, stop it
-		klog.InfoS("Stopping controller", "podName", podName, "currentLeader", currentLeader)
-		cancel()
+	for lease := range leaseChannel {
+		currentLeader := *lease.Spec.HolderIdentity
+		if currentLeader == podName && cancel == nil {
+			// Start modify controller
+			var ctx context.Context
+			ctx, cancel = context.WithCancel(context.Background())
+			go mc.Run(*workers, ctx)
+		} else if currentLeader != podName && cancel != nil {
+			// Shutdown running modify controller
+			cancel()
+			cancel = nil
+		}
 	}
 }
 

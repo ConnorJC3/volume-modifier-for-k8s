@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -108,7 +107,6 @@ func (c *modifyController) Run(workers int, ctx context.Context) {
 	}
 
 	<-stopCh
-	os.Exit(0)
 }
 
 func (c *modifyController) addPVC(obj interface{}) {
