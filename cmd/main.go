@@ -6,22 +6,31 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 
 	csi "github.com/awslabs/volume-modifier-for-k8s/pkg/client"
 	"github.com/awslabs/volume-modifier-for-k8s/pkg/controller"
 	"github.com/awslabs/volume-modifier-for-k8s/pkg/modifier"
-	"github.com/awslabs/volume-modifier-for-k8s/pkg/util"
-	"github.com/kubernetes-csi/csi-lib-utils/leaderelection"
 	"github.com/kubernetes-csi/csi-lib-utils/metrics"
+	v1 "k8s.io/api/coordination/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 )
+
+var (
+	controllerStatus atomic.Value
+)
+
+func init() {
+	controllerStatus.Store(false)
+}
 
 var (
 	clientConfigUrl = flag.String("client-config-url", "", "URL to build a client config from. Either this or kubeconfig needs to be set if the provisioner is being run out of cluster.")
@@ -63,6 +72,11 @@ func main() {
 		os.Exit(0)
 	}
 	klog.Infof("Version : %s", version)
+
+	podName := os.Getenv("POD_NAME")
+	if podName == "" {
+		klog.Fatal("POD_NAME environment variable is not set")
+	}
 
 	addr := *httpEndpoint
 	var config *rest.Config
@@ -134,37 +148,41 @@ func main() {
 		true, /* retryFailure */
 	)
 
-	run := func(ctx context.Context) {
-		informerFactory.Start(wait.NeverStop)
-		mc.Run(*workers, ctx)
+	ctx, cancel := context.WithCancel(context.Background())
+	leaseInformer := informerFactory.Coordination().V1().Leases().Informer()
+
+	leaseInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			lease, ok := newObj.(*v1.Lease)
+			if !ok {
+				klog.ErrorS(nil, "Failed to process object, expected it to be a Lease", "obj", newObj)
+				return
+			}
+			handleLeaseUpdate(lease, podName, ctx, cancel, mc)
+		},
+	})
+	leaseInformer.Run(wait.NeverStop)
+}
+
+func handleLeaseUpdate(lease *v1.Lease, podName string, ctx context.Context, cancel context.CancelFunc, mc controller.ModifyController) {
+	// If the updated Lease is not relevant, return early
+	if lease.Name != "external-resizer-ebs-csi-aws-com" {
+		return
 	}
+	// Extract the current leader from the Lease
+	currentLeader := *lease.Spec.HolderIdentity
 
-	if !*enableLeaderElection {
-		run(context.TODO())
-	} else {
-		// Ensure volume-modifier-for-k8s and external-resizer sidecars always elect the same leader
-		// by putting them on the same lease that is identified by the lock name.
-		externalResizerLockName := "external-resizer-" + util.SanitizeName(driverName)
-		leKubeClient, err := kubernetes.NewForConfig(config)
-		if err != nil {
-			klog.Fatal(err.Error())
-		}
-		le := leaderelection.NewLeaderElection(leKubeClient, externalResizerLockName, run)
-		if *httpEndpoint != "" {
-			le.PrepareHealthCheck(mux, leaderelection.DefaultHealthCheckTimeout)
-		}
+	klog.V(6).InfoS("Controller status", "podName", podName, "currentLeader", currentLeader, "controllerStatus", controllerStatus.Load().(bool))
 
-		if *leaderElectionNamespace != "" {
-			le.WithNamespace(*leaderElectionNamespace)
-		}
-
-		le.WithLeaseDuration(*leaderElectionLeaseDuration)
-		le.WithRenewDeadline(*leaderElectionRenewDeadline)
-		le.WithRetryPeriod(*leaderElectionRetryPeriod)
-
-		if err := le.Run(); err != nil {
-			klog.Fatalf("error initializing leader election: %v", err)
-		}
+	if currentLeader == podName && !controllerStatus.Load().(bool) {
+		// If the current leader is the current pod, and the controller is not running, start it
+		klog.InfoS("Starting controller", "podName", podName, "currentLeader", currentLeader)
+		controllerStatus.Store(true)
+		go mc.Run(*workers, ctx)
+	} else if currentLeader != podName && controllerStatus.Load().(bool) {
+		// If the current leader is not the current pod, and the controller is running, stop it
+		klog.InfoS("Stopping controller", "podName", podName, "currentLeader", currentLeader)
+		cancel()
 	}
 }
 
